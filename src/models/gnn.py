@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.preprocessing import RobustScaler, StandardScaler
+# pyrefly: ignore [missing-import]
 from torch_geometric.nn import MessagePassing
 from tqdm.auto import trange
 
@@ -38,20 +39,37 @@ from tools.qc import get_bimodal_threshold
 
 
 def normalize_distance_weights(
-    edge_index: np.ndarray, edge_dist: np.ndarray, n_nodes: int, length_scale: float
+    edge_index: np.ndarray, edge_dist: np.ndarray, n_nodes: int, length_scale: float, normalize: bool = True
 ) -> torch.Tensor:
     """
     Exponential distance decay (`exp(-dist / length_scale)`, closer neighbors get a
     larger raw weight, always positive so a `min_neighbors` fallback edge -- see
     `radius_edge_index` -- never gets a zero/negative weight just for sitting past
-    `radius`), then row-normalized so each node's INCOMING edge weights sum to
-    exactly 1. That normalization is what turns "a decreasing function of distance"
-    into an actual weighted-averaging adjacency matrix, the spatial-graph analog of
-    GCN's degree normalization.
+    `radius`), then (if `normalize`) row-normalized so each node's INCOMING edge
+    weights sum to exactly 1. That normalization is what turns "a decreasing function
+    of distance" into an actual weighted-AVERAGING adjacency matrix, the spatial-graph
+    analog of GCN's degree normalization.
+
+    `normalize=False` skips that step, leaving the raw per-edge decay weight as-is.
+    `WeightedNeighborConv` aggregates with `aggr="add"`, so a normalized weight (sums
+    to 1) makes that a weighted AVERAGE -- insensitive to neighbor COUNT, since a
+    5-neighbor and a 50-neighbor node can produce the same aggregate if their feature
+    distributions look similar (this is exactly why `tools.morphology.local_density`
+    exists as a separate explicit feature: mean/attention aggregators normalize count
+    information away). Without normalization, aggregation becomes a weighted SUM
+    (GraphSAGE/GIN-style) -- a node with more/closer neighbors accumulates a strictly
+    larger total signal, so degree/density becomes implicitly recoverable from the
+    embedding's magnitude alone, without needing `local_density` as an input at all.
+    Only meaningfully changes GNN behavior: GAT's attention is softmax-normalized by
+    `GATConv` regardless of this flag (that normalization is intrinsic to how
+    attention is computed, not something this edge weight controls for GAT) -- this
+    only changes the edge FEATURE GAT conditions its (still sum-to-1) attention on.
     """
     dist = torch.as_tensor(edge_dist, dtype=torch.float32)
     dst = torch.as_tensor(edge_index[1], dtype=torch.long)
     w = torch.exp(-dist / length_scale)
+    if not normalize:
+        return w
     denom = torch.zeros(n_nodes, dtype=torch.float32).scatter_add_(0, dst, w)
     return w / denom[dst].clamp(min=1e-8)
 
@@ -61,20 +79,28 @@ def build_radius_graph(
     radius: float,
     min_neighbors: int = 1,
     length_scale: Optional[float] = None,
+    normalize_weights: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Connects every pair of cells within `radius` pixels (see
     `tools.morphology.radius_edge_index` -- NOT a fixed-k graph, so node degree is a
-    direct density signal), then converts distance into a normalized edge weight
+    direct density signal), then converts distance into an edge weight
     (`normalize_distance_weights`, `length_scale` defaults to `radius`).
+
+    `normalize_weights=False`: see `normalize_distance_weights` -- turns the GNN's
+    aggregation from a weighted average into a weighted sum, an alternative to an
+    explicit `local_density` feature for letting the model see neighbor count/density.
 
     Returns
     -------
     edge_index : (2, E) int64 tensor, COO format, symmetric.
-    edge_weight : (E,) float32 tensor, each destination node's incoming weights sum to 1.
+    edge_weight : (E,) float32 tensor -- sums to 1 per destination node if
+        `normalize_weights` (default), else the raw per-edge distance-decay weight.
     """
     edge_index_np, edge_dist_np = radius_edge_index(centroids, radius=radius, min_neighbors=min_neighbors)
-    edge_weight = normalize_distance_weights(edge_index_np, edge_dist_np, len(centroids), length_scale or radius)
+    edge_weight = normalize_distance_weights(
+        edge_index_np, edge_dist_np, len(centroids), length_scale or radius, normalize=normalize_weights
+    )
     return torch.from_numpy(edge_index_np), edge_weight
 
 
@@ -358,6 +384,7 @@ def build_prediction_data(
     y_cols: Optional[Sequence[str]] = None,
     min_neighbors: int = 1,
     length_scale: Optional[float] = None,
+    normalize_weights: bool = True,
     train_idx: Optional[np.ndarray] = None,
     scaling: str = "log1p_standard",
     arcsinh_cofactor: float = 5.0,
@@ -371,6 +398,11 @@ def build_prediction_data(
     `models.gat.NeighborIFPredictorGAT`, same tensors). `scaling`/
     `arcsinh_cofactor`/`subtract_background` select how each column is scaled --
     see `ColumnScaler`.
+
+    `normalize_weights=False`: see `build_radius_graph`/`normalize_distance_weights`
+    -- an alternative to an explicit `local_density` feature, letting the GNN see
+    neighbor count/density implicitly via a weighted-SUM aggregation instead of a
+    weighted-average one.
 
     `no_background_cols`: column names to exempt from `subtract_background`
     even when it's True for the rest of the group -- e.g. `local_density`,
@@ -396,7 +428,7 @@ def build_prediction_data(
     y_cols = [c for c in if_channels if c not in global_x_cols] if y_cols is None else list(y_cols)
 
     centroids = df[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float32)
-    edge_index, edge_weight = build_radius_graph(centroids, radius, min_neighbors, length_scale)
+    edge_index, edge_weight = build_radius_graph(centroids, radius, min_neighbors, length_scale, normalize_weights)
 
     fit_slice = df if train_idx is None else df.iloc[train_idx]
     x_global, global_scaler = _scale_columns(
@@ -434,6 +466,7 @@ def build_multi_image_prediction_data(
     y_cols: Optional[Sequence[str]] = None,
     min_neighbors: int = 1,
     length_scale: Optional[float] = None,
+    normalize_weights: bool = True,
     train_idx: Optional[np.ndarray] = None,
     scaling: str = "log1p_standard",
     arcsinh_cofactor: float = 5.0,
@@ -470,7 +503,7 @@ def build_multi_image_prediction_data(
     offset = 0
     for cell_df in cell_dfs:
         centroids = cell_df[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float32)
-        ei, ew = build_radius_graph(centroids, radius, min_neighbors, length_scale)
+        ei, ew = build_radius_graph(centroids, radius, min_neighbors, length_scale, normalize_weights)
         edge_index_parts.append(ei + offset)
         edge_weight_parts.append(ew)
         offset += len(cell_df)
@@ -615,6 +648,7 @@ def save_model(
     min_neighbors: int = 1,
     length_scale: Optional[float] = None,
     density_radius: Optional[float] = None,
+    normalize_weights: bool = True,
 ) -> None:
     """
     Saves `model.state_dict()` (just the weight tensors -- much smaller and more
@@ -634,6 +668,13 @@ def save_model(
     `apply_prediction_data` call (e.g. in `cross_predict.ipynb`) recomputes
     `local_density` the same way training did, instead of assuming it equals
     the graph radius.
+
+    `normalize_weights` MUST match whatever `build_prediction_data`/
+    `build_multi_image_prediction_data` was called with -- it changes what the
+    saved `edge_weight` actually MEANS (a weighted-average vs. weighted-sum
+    adjacency, see `normalize_distance_weights`), so `apply_prediction_data`
+    needs the exact same setting to rebuild an eval graph the trained weights
+    still interpret correctly.
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -650,6 +691,7 @@ def save_model(
             min_neighbors=min_neighbors,
             length_scale=length_scale,
             density_radius=density_radius,
+            normalize_weights=normalize_weights,
         ),
         path,
     )
@@ -679,7 +721,8 @@ def apply_prediction_data(df: pd.DataFrame, checkpoint: dict) -> dict:
     """
     centroids = df[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float32)
     edge_index, edge_weight = build_radius_graph(
-        centroids, checkpoint["radius"], checkpoint.get("min_neighbors", 1), checkpoint.get("length_scale")
+        centroids, checkpoint["radius"], checkpoint.get("min_neighbors", 1), checkpoint.get("length_scale"),
+        checkpoint.get("normalize_weights", True),
     )
 
     def scale(cols: list[str], scaler: Optional[ColumnScaler]) -> np.ndarray:

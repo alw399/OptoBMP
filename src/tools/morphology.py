@@ -810,7 +810,7 @@ def plot_loss_curves(histories: dict[str, dict[str, list[float]]], title: str = 
         ax.plot(epochs, hist["train_loss"], color=color, label=f"{name} (train)")
         ax.plot(epochs, hist["val_loss"], color=color, linestyle="--", label=f"{name} (val)")
     ax.set_xlabel("epoch")
-    ax.set_ylabel("MSE loss (standardized units)")
+    ax.set_ylabel("MSE loss")
     ax.set_yscale("log")
     ax.set_title(title)
     ax.legend(fontsize=8)
