@@ -27,6 +27,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.preprocessing import RobustScaler, StandardScaler
 # pyrefly: ignore [missing-import]
+from torch_geometric.data import Data
+# pyrefly: ignore [missing-import]
+from torch_geometric.loader import NeighborLoader
+# pyrefly: ignore [missing-import]
 from torch_geometric.nn import MessagePassing
 from tqdm.auto import trange
 
@@ -79,7 +83,7 @@ def build_radius_graph(
     radius: float,
     min_neighbors: int = 1,
     length_scale: Optional[float] = None,
-    normalize_weights: bool = True,
+    normalize_data: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Connects every pair of cells within `radius` pixels (see
@@ -87,19 +91,22 @@ def build_radius_graph(
     direct density signal), then converts distance into an edge weight
     (`normalize_distance_weights`, `length_scale` defaults to `radius`).
 
-    `normalize_weights=False`: see `normalize_distance_weights` -- turns the GNN's
+    `normalize_data=False`: see `normalize_distance_weights` -- turns the GNN's
     aggregation from a weighted average into a weighted sum, an alternative to an
     explicit `local_density` feature for letting the model see neighbor count/density.
+    Pass this SAME value as `NeighborIFPredictor`'s `normalize_data` constructor
+    arg too (see its docstring) -- one decision, shared by the data pipeline and
+    the model architecture.
 
     Returns
     -------
     edge_index : (2, E) int64 tensor, COO format, symmetric.
     edge_weight : (E,) float32 tensor -- sums to 1 per destination node if
-        `normalize_weights` (default), else the raw per-edge distance-decay weight.
+        `normalize_data` (default), else the raw per-edge distance-decay weight.
     """
     edge_index_np, edge_dist_np = radius_edge_index(centroids, radius=radius, min_neighbors=min_neighbors)
     edge_weight = normalize_distance_weights(
-        edge_index_np, edge_dist_np, len(centroids), length_scale or radius, normalize=normalize_weights
+        edge_index_np, edge_dist_np, len(centroids), length_scale or radius, normalize=normalize_data
     )
     return torch.from_numpy(edge_index_np), edge_weight
 
@@ -147,7 +154,30 @@ class NeighborRadiusGNN(nn.Module):
     """Stack of `WeightedNeighborConv` layers -- an embedding built purely from
     neighbors' `neighbor_x_cols`, over the radius graph. Same `num_layers=1` default
     and 2-hop leakage caveat as `tools.morphology.NeighborOnlyGNN`: at 1 layer, node
-    i's embedding is strictly a function of its direct neighbors' raw features."""
+    i's embedding is strictly a function of its direct neighbors' raw features.
+
+    `normalize_data` MUST be the SAME value passed to `build_radius_graph`/
+    `build_prediction_data` when this data's edge weights were built -- one
+    decision, shared by the data pipeline and this architecture, not two
+    independently-set flags that happen to need to agree (a prior version had
+    it that way, as a same-named-but-separate `normalize_weights` model arg,
+    and mismatching the two silently broke training -- see git history). When
+    False, `WeightedNeighborConv`'s fixed-weight aggregation becomes a weighted
+    SUM instead of a weighted AVERAGE (see `normalize_distance_weights`), whose
+    magnitude scales with local density (the same signal an explicit
+    `local_density` column would otherwise supply). That breaks `init_weights`'s
+    Kaiming "~unit-variance input" assumption for whatever consumes the LAST
+    conv's output -- by design, that layer skips ReLU/dropout (a regression
+    embedding shouldn't be forced non-negative right before a linear head), so
+    nothing renormalizes it before it reaches `NeighborIFPredictor.head`. When
+    `normalize_data=False`, an extra `BatchNorm1d` is added after the last conv
+    (ReLU/dropout still skipped) to fix that -- BatchNorm rescales per-CHANNEL
+    scale, not cross-node relative magnitude, so a denser node's embedding is
+    still larger than a sparser node's after it, just consistently scaled, so
+    the density signal survives. When True (the default -- weighted-average
+    output is already ~unit-scale), no extra norm is added: `self.final_norm`
+    stays `None`, so old checkpoints trained before this parameter existed
+    still load unchanged."""
 
     def __init__(
         self,
@@ -156,6 +186,7 @@ class NeighborRadiusGNN(nn.Module):
         hidden_channels: int = 64,
         num_layers: int = 1,
         dropout: float = 0.1,
+        normalize_data: bool = True,
     ):
         super().__init__()
         if num_layers < 1:
@@ -163,6 +194,7 @@ class NeighborRadiusGNN(nn.Module):
         dims = [in_channels] + [hidden_channels] * (num_layers - 1) + [out_channels]
         self.convs = nn.ModuleList(WeightedNeighborConv(dims[i], dims[i + 1]) for i in range(num_layers))
         self.norms = nn.ModuleList(nn.BatchNorm1d(dims[i + 1]) for i in range(num_layers - 1))
+        self.final_norm = None if normalize_data else nn.BatchNorm1d(out_channels)
         self.dropout = dropout
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor) -> torch.Tensor:
@@ -171,6 +203,8 @@ class NeighborRadiusGNN(nn.Module):
             if i < len(self.convs) - 1:
                 x = F.relu(self.norms[i](x))
                 x = F.dropout(x, p=self.dropout, training=self.training)
+        if self.final_norm is not None:
+            x = self.final_norm(x)
         return x
 
 
@@ -178,7 +212,11 @@ class NeighborIFPredictor(nn.Module):
     """Encoder (`NeighborRadiusGNN` over `neighbor_x_cols`) + a linear head that also
     sees `x_global` (the cell's OWN `global_x_cols`, concatenated in directly -- no
     message passing) -- predicts `y_cols`. `global_in_channels=0` (i.e.
-    `global_x_cols=[]`) is fine: concatenating a zero-width tensor is a no-op."""
+    `global_x_cols=[]`) is fine: concatenating a zero-width tensor is a no-op.
+
+    `normalize_data` is passed straight through to `NeighborRadiusGNN` -- see its
+    docstring. MUST be the SAME value `build_prediction_data` was called with for
+    this data, same as `save_model`'s `normalize_data` arg."""
 
     def __init__(
         self,
@@ -189,9 +227,12 @@ class NeighborIFPredictor(nn.Module):
         embedding_dim: int = 32,
         num_layers: int = 1,
         dropout: float = 0.1,
+        normalize_data: bool = True,
     ):
         super().__init__()
-        self.encoder = NeighborRadiusGNN(neighbor_in_channels, embedding_dim, hidden_channels, num_layers, dropout)
+        self.encoder = NeighborRadiusGNN(
+            neighbor_in_channels, embedding_dim, hidden_channels, num_layers, dropout, normalize_data,
+        )
         self.head = nn.Linear(embedding_dim + global_in_channels, num_outputs)
         init_output_layer(self.head)  # no activation follows this layer
 
@@ -384,7 +425,7 @@ def build_prediction_data(
     y_cols: Optional[Sequence[str]] = None,
     min_neighbors: int = 1,
     length_scale: Optional[float] = None,
-    normalize_weights: bool = True,
+    normalize_data: bool = True,
     train_idx: Optional[np.ndarray] = None,
     scaling: str = "log1p_standard",
     arcsinh_cofactor: float = 5.0,
@@ -399,10 +440,11 @@ def build_prediction_data(
     `arcsinh_cofactor`/`subtract_background` select how each column is scaled --
     see `ColumnScaler`.
 
-    `normalize_weights=False`: see `build_radius_graph`/`normalize_distance_weights`
+    `normalize_data=False`: see `build_radius_graph`/`normalize_distance_weights`
     -- an alternative to an explicit `local_density` feature, letting the GNN see
     neighbor count/density implicitly via a weighted-SUM aggregation instead of a
-    weighted-average one.
+    weighted-average one. If used with `NeighborIFPredictor`, pass this SAME value
+    to its `normalize_data` constructor arg too -- see its docstring.
 
     `no_background_cols`: column names to exempt from `subtract_background`
     even when it's True for the rest of the group -- e.g. `local_density`,
@@ -428,7 +470,7 @@ def build_prediction_data(
     y_cols = [c for c in if_channels if c not in global_x_cols] if y_cols is None else list(y_cols)
 
     centroids = df[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float32)
-    edge_index, edge_weight = build_radius_graph(centroids, radius, min_neighbors, length_scale, normalize_weights)
+    edge_index, edge_weight = build_radius_graph(centroids, radius, min_neighbors, length_scale, normalize_data)
 
     fit_slice = df if train_idx is None else df.iloc[train_idx]
     x_global, global_scaler = _scale_columns(
@@ -466,7 +508,7 @@ def build_multi_image_prediction_data(
     y_cols: Optional[Sequence[str]] = None,
     min_neighbors: int = 1,
     length_scale: Optional[float] = None,
-    normalize_weights: bool = True,
+    normalize_data: bool = True,
     train_idx: Optional[np.ndarray] = None,
     scaling: str = "log1p_standard",
     arcsinh_cofactor: float = 5.0,
@@ -503,7 +545,7 @@ def build_multi_image_prediction_data(
     offset = 0
     for cell_df in cell_dfs:
         centroids = cell_df[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float32)
-        ei, ew = build_radius_graph(centroids, radius, min_neighbors, length_scale, normalize_weights)
+        ei, ew = build_radius_graph(centroids, radius, min_neighbors, length_scale, normalize_data)
         edge_index_parts.append(ei + offset)
         edge_weight_parts.append(ew)
         offset += len(cell_df)
@@ -548,6 +590,8 @@ def train_neighbor_predictor(
     patience: int = 20,
     device: str = "cpu",
     desc: str = "training",
+    batch_size: Optional[int] = None,
+    num_neighbors: Optional[Sequence[int]] = None,
 ) -> dict[str, list[float]]:
     """
     Full-batch transductive training (mirrors `tools.morphology.train_gnn`): every
@@ -555,15 +599,64 @@ def train_neighbor_predictor(
     control which cells' own loss/gradients/early-stopping count. Works for both
     `NeighborIFPredictor` (this module) and `models.gat.NeighborIFPredictorGAT` --
     same `forward(x_neighbor, edge_index, edge_weight, x_global)` signature.
+
+    `batch_size` (default `None` -- the full-batch behavior above, unchanged): set
+    it to switch to neighbor-sampled MINIBATCH training via `torch_geometric.loader.
+    NeighborLoader` instead, for graphs too large to fit one full-graph forward +
+    backward pass in GPU/MPS memory (`GATConv`'s per-edge message tensor scales with
+    TOTAL edge count, which for a large radius graph can be tens of GB in a single
+    allocation). Each optimizer step then only processes `batch_size` TARGET cells
+    plus whichever neighbor cells their receptive field pulls in -- not every cell
+    in the graph at once. Requires the `pyg-lib` (or `torch-sparse`) package for
+    `NeighborLoader`'s sampling backend.
+
+    `num_neighbors` (only used when `batch_size` is set) is the per-hop neighbor cap
+    `NeighborLoader` samples -- one entry per message-passing layer, inferred from
+    `len(model.encoder.convs)` if not given. Defaults to `-1` per hop (keep EVERY
+    neighbor, no subsampling), so `batch_size` changes ONLY how many target cells are
+    scored per step, not what each one's neighborhood aggregate actually is: verified
+    numerically that a `-1`-per-hop batched forward pass reproduces the full-batch
+    forward pass EXACTLY (to float32 precision) for whichever cells land in a given
+    batch, in eval mode. In train mode, `BatchNorm1d` layers still see only that
+    batch's statistics rather than the whole graph's -- the same, expected way
+    BatchNorm behaves under minibatching in any other architecture, not a bug or an
+    approximation introduced by the sampling itself. Pass a smaller `num_neighbors`
+    yourself for a further memory/speed tradeoff, at the cost of an actually-
+    approximated (randomly subsampled) neighborhood per step.
     """
     model = model.to(device)
-    x_neighbor = data["x_neighbor"].to(device)
-    x_global = data["x_global"].to(device)
-    edge_index = data["edge_index"].to(device)
-    edge_weight = data["edge_weight"].to(device)
-    y = data["y"].to(device)
-    train_mask = train_mask.to(device)
-    val_mask = val_mask.to(device)
+
+    if batch_size is None:
+        x_neighbor = data["x_neighbor"].to(device)
+        x_global = data["x_global"].to(device)
+        edge_index = data["edge_index"].to(device)
+        edge_weight = data["edge_weight"].to(device)
+        y = data["y"].to(device)
+        train_mask = train_mask.to(device)
+        val_mask = val_mask.to(device)
+    else:
+        # NeighborLoader's sampling backend runs on CPU regardless of `device` --
+        # build the graph from the ORIGINAL (un-moved) tensors, and move only each
+        # already-small sampled batch to `device` inside the loop below.
+        if num_neighbors is None:
+            num_neighbors = [-1] * len(model.encoder.convs)
+        # `.contiguous()`: `edge_index` comes from a `.T`-transposed numpy array
+        # (`tools.morphology.radius_edge_index`), so the tensor `torch.from_numpy`
+        # produces is a non-contiguous view -- `pyg_lib`'s sampler backend requires
+        # contiguous input.
+        graph = Data(
+            x=data["x_neighbor"], x_global=data["x_global"], y=data["y"],
+            edge_index=data["edge_index"].contiguous(), edge_weight=data["edge_weight"],
+            num_nodes=data["x_neighbor"].size(0),
+        )
+        train_loader = NeighborLoader(
+            graph, num_neighbors=list(num_neighbors), batch_size=batch_size,
+            input_nodes=train_mask, shuffle=True,
+        )
+        val_loader = NeighborLoader(
+            graph, num_neighbors=list(num_neighbors), batch_size=batch_size,
+            input_nodes=val_mask, shuffle=False,
+        )
 
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     best_val, best_state, bad_epochs = float("inf"), None, 0
@@ -571,21 +664,50 @@ def train_neighbor_predictor(
 
     pbar = trange(epochs, desc=desc, leave=True)
     for _ in pbar:
-        model.train()
-        opt.zero_grad()
-        pred, _ = model(x_neighbor, edge_index, edge_weight, x_global)
-        loss = F.mse_loss(pred[train_mask], y[train_mask])
-        loss.backward()
-        opt.step()
-
-        model.eval()
-        with torch.no_grad():
+        if batch_size is None:
+            model.train()
+            opt.zero_grad()
             pred, _ = model(x_neighbor, edge_index, edge_weight, x_global)
-            val_loss = F.mse_loss(pred[val_mask], y[val_mask]).item()
+            train_loss = F.mse_loss(pred[train_mask], y[train_mask])
+            train_loss.backward()
+            opt.step()
+            train_loss = train_loss.item()
 
-        history["train_loss"].append(loss.item())
+            model.eval()
+            with torch.no_grad():
+                pred, _ = model(x_neighbor, edge_index, edge_weight, x_global)
+                val_loss = F.mse_loss(pred[val_mask], y[val_mask]).item()
+        else:
+            model.train()
+            total_loss = total_n = 0
+            for batch in train_loader:
+                batch = batch.to(device)
+                opt.zero_grad()
+                pred, _ = model(batch.x, batch.edge_index, batch.edge_weight, batch.x_global)
+                # Only the first `batch.batch_size` nodes are TARGETS -- the rest are
+                # sampled neighbors pulled in purely to support message passing, the
+                # same role border-excluded/non-train cells play in the full-batch path.
+                loss = F.mse_loss(pred[: batch.batch_size], batch.y[: batch.batch_size])
+                loss.backward()
+                opt.step()
+                total_loss += loss.item() * batch.batch_size
+                total_n += batch.batch_size
+            train_loss = total_loss / total_n
+
+            model.eval()
+            total_val_loss = total_val_n = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = batch.to(device)
+                    pred, _ = model(batch.x, batch.edge_index, batch.edge_weight, batch.x_global)
+                    vloss = F.mse_loss(pred[: batch.batch_size], batch.y[: batch.batch_size])
+                    total_val_loss += vloss.item() * batch.batch_size
+                    total_val_n += batch.batch_size
+            val_loss = total_val_loss / total_val_n
+
+        history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
-        pbar.set_postfix(train=f"{loss.item():.4f}", val=f"{val_loss:.4f}")
+        pbar.set_postfix(train=f"{train_loss:.4f}", val=f"{val_loss:.4f}")
 
         if val_loss < best_val - 1e-6:
             best_val = val_loss
@@ -648,7 +770,7 @@ def save_model(
     min_neighbors: int = 1,
     length_scale: Optional[float] = None,
     density_radius: Optional[float] = None,
-    normalize_weights: bool = True,
+    normalize_data: bool = True,
 ) -> None:
     """
     Saves `model.state_dict()` (just the weight tensors -- much smaller and more
@@ -669,12 +791,15 @@ def save_model(
     `local_density` the same way training did, instead of assuming it equals
     the graph radius.
 
-    `normalize_weights` MUST match whatever `build_prediction_data`/
+    `normalize_data` MUST match whatever `build_prediction_data`/
     `build_multi_image_prediction_data` was called with -- it changes what the
     saved `edge_weight` actually MEANS (a weighted-average vs. weighted-sum
     adjacency, see `normalize_distance_weights`), so `apply_prediction_data`
     needs the exact same setting to rebuild an eval graph the trained weights
-    still interpret correctly.
+    still interpret correctly. If `model` is a `NeighborIFPredictor`, its own
+    `normalize_data` constructor arg should have been set to this same value
+    too (`model_kwargs` already carries whatever that was, independently of
+    what's saved here).
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -691,7 +816,7 @@ def save_model(
             min_neighbors=min_neighbors,
             length_scale=length_scale,
             density_radius=density_radius,
-            normalize_weights=normalize_weights,
+            normalize_data=normalize_data,
         ),
         path,
     )
@@ -720,9 +845,13 @@ def apply_prediction_data(df: pd.DataFrame, checkpoint: dict) -> dict:
     this is for evaluation only, not further training.
     """
     centroids = df[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float32)
+    # "normalize_weights" fallback: checkpoints saved by `save_model` before it was
+    # renamed to `normalize_data` still have the old key -- not a model_kwargs concern,
+    # since this is the DATA-side flag (see `save_model`'s docstring).
+    normalize_data = checkpoint.get("normalize_data", checkpoint.get("normalize_weights", True))
     edge_index, edge_weight = build_radius_graph(
         centroids, checkpoint["radius"], checkpoint.get("min_neighbors", 1), checkpoint.get("length_scale"),
-        checkpoint.get("normalize_weights", True),
+        normalize_data,
     )
 
     def scale(cols: list[str], scaler: Optional[ColumnScaler]) -> np.ndarray:

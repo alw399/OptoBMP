@@ -230,6 +230,77 @@ def simulate_perfect_cells(
     )
 
 
+def jitter_real_cells(
+    label_mask: np.ndarray,
+    cell_df: pd.DataFrame,
+    position_jitter_std: float,
+    seed: Optional[int] = None,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """
+    Takes a REAL segmentation's cell centers (`cell_df`'s `centroid_y`/
+    `centroid_x`) and per-cell radius implied by its real `area` (`r =
+    sqrt(area / pi)`, i.e. treating each irregular real nucleus as a circle of
+    equal area), adds iid Gaussian XY jitter (std `position_jitter_std`, mean
+    0) to every center, and re-rasterizes into a brand new label mask --
+    same `image_shape` as `label_mask`, same nearest-center Voronoi tie-break
+    as `simulate_cells`/`_rasterize_disks`.
+
+    This changes each cell's POSITION (and, as a side effect of the Voronoi
+    re-tiling, its exact pixel-level size/shape) while every OTHER column of
+    `cell_df` -- markers, `_mean`/`+` columns, etc. -- travels with that same
+    cell unchanged. That's the point: simulating "what if these exact cells,
+    with these exact marker readouts, had been arranged slightly
+    differently", rather than simulating new cells from scratch the way
+    `simulate_cells` does.
+
+    The output mask is relabeled so pixel value == the surviving cell's
+    original `cell_df` index (same convention as the input), not the
+    positional 1..N label `_rasterize_disks` assigns internally. Any cell
+    whose jittered disk ends up with zero surviving pixels (fully occluded by
+    a neighbor that jittered on top of it) is dropped from the returned
+    `cell_df` -- a warning is printed with the count, since a high drop rate
+    means `position_jitter_std` is too large relative to cell spacing/size
+    for the result to be trustworthy.
+
+    Returns
+    -------
+    jittered_label_mask : (H, W) int32 array, 0 = background, other values =
+        the SAME `cell_id`s as `cell_df.index` (a subset, if any were dropped).
+    jittered_cell_df : DataFrame indexed by `cell_id` (matching
+        `jittered_label_mask`), with recomputed geometry columns (from the new
+        rasterized shapes) plus every other original `cell_df` column carried
+        over unchanged from the matching input cell.
+    """
+    if position_jitter_std < 0:
+        raise ValueError(f"position_jitter_std must be >= 0, got {position_jitter_std}")
+
+    rng = np.random.default_rng(seed)
+    cell_ids = cell_df.index.to_numpy()
+    centers = cell_df[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float64)
+    radii = np.sqrt(cell_df["area"].to_numpy(dtype=np.float64) / np.pi)
+
+    if position_jitter_std > 0:
+        centers = centers + rng.normal(0.0, position_jitter_std, size=centers.shape)
+
+    positional_mask = _rasterize_disks(label_mask.shape, centers, radii)  # positional labels 1..N
+
+    lut = np.zeros(len(cell_ids) + 1, dtype=positional_mask.dtype)
+    lut[1:] = cell_ids
+    jittered_label_mask = lut[positional_mask]  # relabel: pixel value == original cell_id
+
+    geom_df = _morphology_from_mask(jittered_label_mask)  # index already real cell_id, post-relabel
+    n_dropped = len(cell_ids) - len(geom_df)
+    if n_dropped:
+        print(
+            f"jitter_real_cells: {n_dropped} / {len(cell_ids)} cells lost all pixels at "
+            f"position_jitter_std={position_jitter_std} and were dropped"
+        )
+
+    carry_cols = [c for c in cell_df.columns if c not in geom_df.columns]
+    jittered_cell_df = geom_df.join(cell_df[carry_cols])
+    return jittered_label_mask, jittered_cell_df
+
+
 def simulate_jittered_cells(
     image_shape: tuple[int, int] = (1998, 1998),
     radius_mean: float = RADIUS_MEAN_DEFAULT,
@@ -246,3 +317,61 @@ def simulate_jittered_cells(
         image_shape, radius_mean=radius_mean, radius_std=radius_std, spacing=spacing,
         position_jitter_std=position_jitter_std, margin=margin, seed=seed,
     )
+
+
+def build_scaled_feature_frame(
+    label_mask: np.ndarray,
+    cell_df: pd.DataFrame,
+    if_cols: list[str],
+    global_x_cols: list[str],
+    neighbor_x_cols: list[str],
+    y_cols: list[str],
+    pred_radius: float,
+    density_radius: float,
+    scaling: str,
+    normalize_data: bool,
+    seed: int,
+) -> pd.DataFrame:
+    """
+    Runs the same `models.gnn.build_prediction_data` pipeline `sender_predict.ipynb` uses
+    for actual training, but only to recover its SCALED feature columns (plus
+    `centroid_y`/`centroid_x`) as a plain DataFrame -- for a "does this look different
+    before vs. after jitter" spatial-scatter comparison, not for training a model.
+
+    Meant to be called TWICE with the SAME hyperparameters -- once on a real
+    `(label_mask, cell_df)` pair, once on its `jitter_real_cells` output -- so both
+    results share identical scaling/train-split logic and are directly comparable
+    (e.g. with a shared `vmin`/`vmax` per column across both calls' outputs).
+
+    Imports `models.gnn`/torch lazily, so importing `tools.simulated` itself stays free
+    of a torch_geometric dependency for callers who only need `simulate_cells`/
+    `jitter_real_cells`.
+    """
+    from models.gnn import border_mask, build_prediction_data
+    from tools.morphology import local_density, split_indices
+
+    cell_df = cell_df.copy()
+    centroids = cell_df[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float32)
+    cell_df["local_density"] = local_density(centroids, radius=density_radius)
+
+    is_border = border_mask(centroids, label_mask.shape, pred_radius)
+    valid_target_idx = np.where(~is_border)[0]
+    train_pos, _, _ = split_indices(len(valid_target_idx), val_frac=0.15, test_frac=0.15, seed=seed)
+    train_idx = valid_target_idx[train_pos]
+
+    pred_data = build_prediction_data(
+        cell_df, if_cols, radius=pred_radius,
+        global_x_cols=global_x_cols, neighbor_x_cols=neighbor_x_cols, y_cols=y_cols,
+        train_idx=train_idx, scaling=scaling,
+        no_background_cols=["local_density"], no_transform_cols=["local_density"],
+        normalize_data=normalize_data,
+    )
+
+    frame = pd.DataFrame(pred_data["y"], columns=pred_data["y_cols"])
+    for i, col in enumerate(pred_data["global_x_cols"]):
+        frame[col] = pred_data["x_global"][:, i]
+    for i, col in enumerate(pred_data["neighbor_x_cols"]):
+        frame[col] = pred_data["x_neighbor"][:, i]  # overwrites same-named global_x_cols column
+    frame["centroid_x"] = cell_df["centroid_x"].values
+    frame["centroid_y"] = cell_df["centroid_y"].values
+    return frame
