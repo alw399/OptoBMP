@@ -740,7 +740,8 @@ def predict_df(
     if y_scaler is _AUTO:
         y_scaler = data["y_scaler"]
     model.eval()
-    pred, _ = model(data["x_neighbor"], data["edge_index"], data["edge_weight"], data["x_global"])
+    with torch.no_grad():
+        pred, _ = model(data["x_neighbor"], data["edge_index"], data["edge_weight"], data["x_global"])
     mask_np = mask.cpu().numpy()
     pred_scaled = pred[mask].cpu().numpy()
     true_scaled = data["y"][mask].cpu().numpy()
