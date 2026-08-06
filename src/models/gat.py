@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 # pyrefly: ignore [missing-import]
 from torch_geometric.nn import GATConv
 
@@ -73,7 +74,19 @@ class NeighborRadiusGAT(nn.Module):
     to learn away from it during training. Off by default: it doesn't change
     any parameter's SHAPE (old checkpoints still load either way), only its
     INITIAL VALUE, so this is purely a training-dynamics choice, not a
-    backwards-compatibility one -- opt in explicitly to use it."""
+    backwards-compatibility one -- opt in explicitly to use it.
+
+    `use_checkpoint=True` wraps each layer's `GATConv` call in
+    `torch.utils.checkpoint.checkpoint` -- trades extra compute (each layer's
+    forward runs twice: once discarded, once replayed during backward) for
+    lower activation memory, with the EXACT same result (no approximation),
+    since it changes what's stored for backward, not what's computed. Only the
+    conv call itself is checkpointed, not the following BatchNorm/dropout --
+    BatchNorm's running-stats update is a buffer write with a side effect, not
+    a tracked autograd op, so it would silently double-update if it were
+    inside the checkpointed region (checkpoint replays its function during
+    backward). Off by default; a plain memory/speed knob with no accuracy
+    impact either way."""
 
     def __init__(
         self,
@@ -84,6 +97,7 @@ class NeighborRadiusGAT(nn.Module):
         heads: int = 4,
         dropout: float = 0.1,
         distance_init: bool = False,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         if num_layers < 1:
@@ -107,12 +121,16 @@ class NeighborRadiusGAT(nn.Module):
                 self.norms.append(nn.BatchNorm1d(in_dim))
         self.dropout = dropout
         self.distance_init = distance_init
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
         if self.distance_init:
             edge_attr = torch.log(edge_attr.clamp_min(1e-8))  # see _init_distance_attention
         for i, conv in enumerate(self.convs):
-            x = conv(x, edge_index, edge_attr)
+            if self.use_checkpoint and torch.is_grad_enabled():
+                x = checkpoint(conv, x, edge_index, edge_attr, use_reentrant=False)
+            else:
+                x = conv(x, edge_index, edge_attr)
             if i < len(self.convs) - 1:
                 x = F.relu(self.norms[i](x))
                 x = F.dropout(x, p=self.dropout, training=self.training)
@@ -167,8 +185,8 @@ class NeighborIFPredictorGAT(nn.Module):
     Same `forward` signature as `gnn.NeighborIFPredictor`, so
     `gnn.train_neighbor_predictor`/`gnn.predict_df` work on this model unchanged.
 
-    `distance_init` is passed straight through to `NeighborRadiusGAT` -- see its
-    docstring."""
+    `distance_init`/`use_checkpoint` are passed straight through to
+    `NeighborRadiusGAT` -- see its docstring."""
 
     def __init__(
         self,
@@ -181,10 +199,12 @@ class NeighborIFPredictorGAT(nn.Module):
         heads: int = 4,
         dropout: float = 0.1,
         distance_init: bool = False,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.encoder = NeighborRadiusGAT(
             neighbor_in_channels, embedding_dim, hidden_channels, num_layers, heads, dropout, distance_init,
+            use_checkpoint=use_checkpoint,
         )
         self.head = nn.Linear(embedding_dim + global_in_channels, num_outputs)
         init_output_layer(self.head)  # no activation follows this layer

@@ -25,6 +25,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from sklearn.preprocessing import RobustScaler, StandardScaler
 # pyrefly: ignore [missing-import]
 from torch_geometric.data import Data
@@ -177,7 +178,18 @@ class NeighborRadiusGNN(nn.Module):
     the density signal survives. When True (the default -- weighted-average
     output is already ~unit-scale), no extra norm is added: `self.final_norm`
     stays `None`, so old checkpoints trained before this parameter existed
-    still load unchanged."""
+    still load unchanged.
+
+    `use_checkpoint=True` wraps each layer's `WeightedNeighborConv` call in
+    `torch.utils.checkpoint.checkpoint` -- trades extra compute (each layer's
+    forward runs twice: once discarded, once replayed during backward) for
+    lower activation memory, with the EXACT same result (no approximation),
+    since it changes what's stored for backward, not what's computed. Only
+    the conv call itself is checkpointed, not the following BatchNorm/dropout
+    -- BatchNorm's running-stats update is a buffer write with a side effect,
+    not a tracked autograd op, so it would silently double-update if it were
+    inside the checkpointed region. Off by default; a plain memory/speed knob
+    with no accuracy impact either way."""
 
     def __init__(
         self,
@@ -187,6 +199,7 @@ class NeighborRadiusGNN(nn.Module):
         num_layers: int = 1,
         dropout: float = 0.1,
         normalize_data: bool = True,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         if num_layers < 1:
@@ -196,10 +209,14 @@ class NeighborRadiusGNN(nn.Module):
         self.norms = nn.ModuleList(nn.BatchNorm1d(dims[i + 1]) for i in range(num_layers - 1))
         self.final_norm = None if normalize_data else nn.BatchNorm1d(out_channels)
         self.dropout = dropout
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor) -> torch.Tensor:
         for i, conv in enumerate(self.convs):
-            x = conv(x, edge_index, edge_weight)
+            if self.use_checkpoint and torch.is_grad_enabled():
+                x = checkpoint(conv, x, edge_index, edge_weight, use_reentrant=False)
+            else:
+                x = conv(x, edge_index, edge_weight)
             if i < len(self.convs) - 1:
                 x = F.relu(self.norms[i](x))
                 x = F.dropout(x, p=self.dropout, training=self.training)
@@ -216,7 +233,8 @@ class NeighborIFPredictor(nn.Module):
 
     `normalize_data` is passed straight through to `NeighborRadiusGNN` -- see its
     docstring. MUST be the SAME value `build_prediction_data` was called with for
-    this data, same as `save_model`'s `normalize_data` arg."""
+    this data, same as `save_model`'s `normalize_data` arg. `use_checkpoint` is
+    also passed straight through -- see `NeighborRadiusGNN`'s docstring."""
 
     def __init__(
         self,
@@ -228,10 +246,12 @@ class NeighborIFPredictor(nn.Module):
         num_layers: int = 1,
         dropout: float = 0.1,
         normalize_data: bool = True,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.encoder = NeighborRadiusGNN(
             neighbor_in_channels, embedding_dim, hidden_channels, num_layers, dropout, normalize_data,
+            use_checkpoint=use_checkpoint,
         )
         self.head = nn.Linear(embedding_dim + global_in_channels, num_outputs)
         init_output_layer(self.head)  # no activation follows this layer
@@ -242,6 +262,74 @@ class NeighborIFPredictor(nn.Module):
         z = self.encoder(x_neighbor, edge_index, edge_weight)
         z_full = torch.cat([z, x_global], dim=1)
         return self.head(z_full), z
+
+    def message_sensitivity_by_layer(
+        self, x_neighbor: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor, x_global: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """
+        Edge-level explanation for a model with no learned attention to read off
+        directly -- `WeightedNeighborConv`'s `edge_weight` is a FIXED function of
+        distance alone (see `normalize_distance_weights`), so unlike
+        `gat.NeighborRadiusGAT.attention_by_layer` there's no learned per-edge scalar
+        already sitting in the forward pass to inspect. This substitutes a
+        gradient-based one: for each layer, captures that layer's per-edge message
+        `m_e = edge_weight_e * lin(x_j)` (exactly what `WeightedNeighborConv.message`
+        computes internally), replays the REST of the forward pass (remaining conv
+        layers, then this model's `head`) -- unlike `attention_by_layer`, which stops
+        at the encoder since attention doesn't involve the head, this goes all the
+        way to the actual prediction, since there's no output-independent quantity to
+        fall back on here -- then backpropagates the prediction summed over every
+        cell ONCE back to each layer's captured messages.
+
+        Summing before backpropagating (rather than one backward per cell) is exact,
+        not an approximation: cell i's final output depends only on ITS OWN incoming
+        edges at every layer (`WeightedNeighborConv` never lets a message meant for
+        one destination leak into another), so `d(sum_i out_i)/d(m_e)` already equals
+        `d(out_dst(e))/d(m_e)` -- no cross-cell contamination to worry about.
+
+        Returns one (E,) tensor per layer: `(grad_m * m).sum(-1)`, i.e. grad-times-
+        message ("how much did this edge's ACTUAL contribution move the prediction",
+        the standard attribution choice) rather than the raw gradient alone (which
+        would only say "how sensitive is the prediction to an infinitesimal nudge
+        here", ignoring how large that edge's real contribution actually is).
+
+        Same layering caveat as `attention_by_layer`: only the FIRST layer's messages
+        are a direct function of the raw `neighbor_x_cols` values -- every later
+        layer's messages are built from the previous layer's embeddings, so
+        correlating a later layer's sensitivity against raw neighbor markers reflects
+        an indirect/aggregate relationship, not a direct one.
+
+        Always runs in eval mode with dropout disabled and BatchNorm using its
+        running stats, for the same reason as `attention_by_layer`: this attributes
+        the SAME deterministic computation a real prediction call would use, not one
+        with a different random dropout mask.
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            with torch.enable_grad():
+                encoder = self.encoder
+                src, dst = edge_index[0], edge_index[1]
+                x = x_neighbor
+                messages = []
+                for i, conv in enumerate(encoder.convs):
+                    x_lin = conv.lin(x)
+                    m = x_lin[src] * edge_weight.unsqueeze(-1)
+                    messages.append(m)
+                    z = torch.zeros(x.shape[0], m.shape[-1], dtype=m.dtype, device=m.device)
+                    z = z.scatter_add(0, dst.unsqueeze(-1).expand_as(m), m)
+                    if i < len(encoder.convs) - 1:
+                        z = F.relu(encoder.norms[i](z))
+                        z = F.dropout(z, p=encoder.dropout, training=False)
+                    x = z
+                if encoder.final_norm is not None:
+                    x = encoder.final_norm(x)
+                z_full = torch.cat([x, x_global], dim=1)
+                out = self.head(z_full)
+                grads = torch.autograd.grad(out.sum(), messages)
+                return [(g * m).sum(-1).detach() for g, m in zip(grads, messages)]
+        finally:
+            self.train(was_training)
 
 
 # --------------------------------------------------------------------------
@@ -272,7 +360,9 @@ def estimate_background(values: np.ndarray) -> float:
     if threshold is None:
         return float(series.median())
     negative = series[series < threshold]
-    return float(negative.median()) if len(negative) > 0 else float(series.median())
+    # return float(negative.median()) if len(negative) > 0 else float(series.median())
+    threshold = float(np.percentile(negative, 93)) if len(negative) > 0 else float(series.median())
+    return threshold
 
 
 class ColumnScaler:
@@ -331,6 +421,28 @@ class ColumnScaler:
         `local_density` has no such tail (measured skew ~0.3, sometimes even
         NEGATIVE depending on radius), so log1p only compresses the wrong end
         and makes the distribution more skewed, not less.
+      - `apply_scaling=False` skips the FINAL `StandardScaler`/`RobustScaler` step
+        too, leaving a column completely untouched by this point (still subject
+        to whatever `subtract_background`/`apply_transform` did first -- set
+        those False too for a column that should be truly raw end to end).
+        Meant for an already-binary {0, 1} indicator column (e.g. a thresholded
+        `{channel}+` cast to float): standardizing a column like that can
+        actively hurt rather than help -- with a skewed positive rate `p`, `std =
+        sqrt(p(1-p))` is small, so dividing by it inflates the rarer class into
+        an outlier-sized value purely from how imbalanced the split happened to
+        be, not from any real signal, which is the opposite of what
+        standardization is for.
+
+    `background_overrides` (default `None`, i.e. every column auto-estimates):
+    an optional per-column sequence, one entry per column, where a non-`None`
+    entry is used AS `background_` directly for that column INSTEAD OF ever
+    calling `estimate_background` -- for a channel where the automatic bimodal-
+    threshold estimate (`tools.qc.get_bimodal_threshold`'s `gaussian_kde` call)
+    doesn't hold up for a particular system/dataset (e.g. no clear bimodal
+    split, or a degenerate train slice that makes `gaussian_kde` raise). Takes
+    priority over `subtract_background`/`no_background_cols` entirely for that
+    column -- providing an override IS the decision to subtract that value, so
+    a column can't be BOTH overridden and exempted from background subtraction.
     """
 
     def __init__(
@@ -339,6 +451,8 @@ class ColumnScaler:
         arcsinh_cofactor: float = 5.0,
         subtract_background: Union[bool, Sequence[bool]] = True,
         apply_transform: Union[bool, Sequence[bool]] = True,
+        apply_scaling: Union[bool, Sequence[bool]] = True,
+        background_overrides: Optional[Sequence[Optional[float]]] = None,
     ):
         if scaling not in SCALING_MODES:
             raise ValueError(f"scaling must be one of {SCALING_MODES}, got {scaling!r}")
@@ -346,6 +460,8 @@ class ColumnScaler:
         self.arcsinh_cofactor = arcsinh_cofactor
         self.subtract_background = subtract_background
         self.apply_transform = apply_transform
+        self.apply_scaling = apply_scaling
+        self.background_overrides = background_overrides
         self.background_: Optional[np.ndarray] = None
         self.base_scaler = RobustScaler() if scaling == "robust" else StandardScaler()
 
@@ -379,10 +495,24 @@ class ColumnScaler:
 
     def fit(self, x: np.ndarray) -> "ColumnScaler":
         bg_mask = self._column_mask(self.subtract_background, x.shape[1], "subtract_background")
-        self.background_ = np.array(
-            [estimate_background(x[:, j]) if bg_mask[j] else 0.0 for j in range(x.shape[1])], dtype=np.float32
-        )
+        overrides = self.background_overrides
+        def _background(j: int) -> float:
+            if overrides is not None and overrides[j] is not None:
+                return float(overrides[j])  # bypasses estimate_background entirely -- see class docstring
+            return estimate_background(x[:, j]) if bg_mask[j] else 0.0
+        self.background_ = np.array([_background(j) for j in range(x.shape[1])], dtype=np.float32)
         self.base_scaler.fit(self._forward(x))
+
+        scale_mask = self._column_mask(self.apply_scaling, x.shape[1], "apply_scaling")
+        if not scale_mask.all():
+            # Neither StandardScaler nor RobustScaler has a per-column skip built in --
+            # force an identity transform for these columns by overwriting their fitted
+            # center/scale directly, AFTER the normal fit above (so it doesn't affect
+            # any other column's statistics). transform()/inverse_transform() then act
+            # as a no-op for these columns with no extra branching needed there.
+            center_attr = "mean_" if hasattr(self.base_scaler, "mean_") else "center_"
+            getattr(self.base_scaler, center_attr)[~scale_mask] = 0.0
+            self.base_scaler.scale_[~scale_mask] = 1.0
         return self
 
     def transform(self, x: np.ndarray) -> np.ndarray:
@@ -401,18 +531,25 @@ def _scale_columns(
     subtract_background: bool,
     no_background_cols: Sequence[str],
     no_transform_cols: Sequence[str],
+    no_scale_cols: Sequence[str] = (),
+    custom_background: Optional[dict[str, float]] = None,
 ) -> tuple[np.ndarray, Optional[ColumnScaler]]:
     """Shared by `build_prediction_data`/`build_multi_image_prediction_data`: fits a
     `ColumnScaler` on `fit_slice[cols]` (the training rows) and transforms `df[cols]`
-    (every row). `no_background_cols`/`no_transform_cols` carve out per-column
-    exceptions to the group's otherwise-uniform `subtract_background`/`scaling`."""
+    (every row). `no_background_cols`/`no_transform_cols`/`no_scale_cols` carve out
+    per-column exceptions to the group's otherwise-uniform `subtract_background`/
+    `scaling`/final-StandardScaler-or-RobustScaler step, independently of each other.
+    `custom_background` (name -> value) becomes `ColumnScaler`'s positional
+    `background_overrides`, looked up by name for whichever of `cols` it applies to."""
     if not cols:
         return np.zeros((len(df), 0), dtype=np.float32), None
     bg_mask = [subtract_background and c not in no_background_cols for c in cols]
     transform_mask = [c not in no_transform_cols for c in cols]
-    scaler = ColumnScaler(scaling, arcsinh_cofactor, bg_mask, transform_mask).fit(
-        fit_slice[cols].to_numpy(dtype=np.float32)
-    )
+    scale_mask = [c not in no_scale_cols for c in cols]
+    bg_overrides = [(custom_background or {}).get(c) for c in cols]
+    scaler = ColumnScaler(
+        scaling, arcsinh_cofactor, bg_mask, transform_mask, scale_mask, bg_overrides,
+    ).fit(fit_slice[cols].to_numpy(dtype=np.float32))
     return scaler.transform(df[cols].to_numpy(dtype=np.float32)).astype(np.float32), scaler
 
 
@@ -432,6 +569,8 @@ def build_prediction_data(
     subtract_background: bool = True,
     no_background_cols: Sequence[str] = (),
     no_transform_cols: Sequence[str] = (),
+    no_scale_cols: Sequence[str] = (),
+    custom_background: Optional[dict[str, float]] = None,
 ) -> dict:
     """
     Builds the radius graph (`build_radius_graph`) plus scaled x_global /
@@ -458,6 +597,29 @@ def build_prediction_data(
     (measured skew ~0.3, sometimes negative), so it only makes the
     distribution more skewed, not less.
 
+    `no_scale_cols`: column names to skip the FINAL StandardScaler/RobustScaler
+    step for entirely (see `ColumnScaler`'s per-column `apply_scaling` support) --
+    independent of `no_background_cols`/`no_transform_cols`, combine as needed.
+    Meant for an already-binary {0, 1} column (e.g. a thresholded `{channel}+`
+    cast to float): standardizing it can hurt rather than help, since a skewed
+    positive rate gives a small `std`, and dividing by a small `std` inflates
+    the rarer class into an outlier-sized value purely from class imbalance,
+    not real signal -- the opposite of what standardization is supposed to do.
+
+    `custom_background` ({column_name: value}, default None): overrides
+    `estimate_background`'s automatic bimodal-threshold estimate for whichever
+    columns are given, using the supplied value directly instead -- for a
+    channel where that automatic estimate doesn't hold up for a particular
+    system/dataset (no clean bimodal split, or a train slice degenerate enough
+    to make its `gaussian_kde` call raise). Only affects the columns named as
+    keys; every other column still auto-estimates as usual. Takes priority over
+    `subtract_background`/`no_background_cols` for that column -- supplying an
+    override IS the decision to subtract that value, so a column can't be both
+    overridden and exempted from background subtraction. `tools.qc.
+    get_bimodal_threshold` (run yourself, with whatever settings actually work
+    for that channel) is one reasonable way to compute the value, but any float
+    you trust for that channel's background level is fine.
+
     `neighbor_x_cols` defaults to every column in `if_channels`; `y_cols` defaults to
     every column in `if_channels` EXCLUDING `global_x_cols` (a channel the model
     already sees directly for itself is not worth predicting).
@@ -474,13 +636,16 @@ def build_prediction_data(
 
     fit_slice = df if train_idx is None else df.iloc[train_idx]
     x_global, global_scaler = _scale_columns(
-        df, fit_slice, global_x_cols, scaling, arcsinh_cofactor, subtract_background, no_background_cols, no_transform_cols
+        df, fit_slice, global_x_cols, scaling, arcsinh_cofactor, subtract_background,
+        no_background_cols, no_transform_cols, no_scale_cols, custom_background,
     )
     x_neighbor, neighbor_scaler = _scale_columns(
-        df, fit_slice, neighbor_x_cols, scaling, arcsinh_cofactor, subtract_background, no_background_cols, no_transform_cols
+        df, fit_slice, neighbor_x_cols, scaling, arcsinh_cofactor, subtract_background,
+        no_background_cols, no_transform_cols, no_scale_cols, custom_background,
     )
     y, y_scaler = _scale_columns(
-        df, fit_slice, y_cols, scaling, arcsinh_cofactor, subtract_background, no_background_cols, no_transform_cols
+        df, fit_slice, y_cols, scaling, arcsinh_cofactor, subtract_background,
+        no_background_cols, no_transform_cols, no_scale_cols, custom_background,
     )
 
     return dict(
@@ -515,6 +680,8 @@ def build_multi_image_prediction_data(
     subtract_background: bool = True,
     no_background_cols: Sequence[str] = (),
     no_transform_cols: Sequence[str] = (),
+    no_scale_cols: Sequence[str] = (),
+    custom_background: Optional[dict[str, float]] = None,
 ) -> dict:
     """
     Like `build_prediction_data`, but trains across MULTIPLE images at once
@@ -529,6 +696,9 @@ def build_multi_image_prediction_data(
     also why `local_density`/border exclusion must be computed per-image
     BEFORE calling this (each image has its own neighborhoods/edges), not
     recomputed here.
+
+    `no_background_cols`/`no_transform_cols`/`no_scale_cols`/`custom_background`:
+    same per-column exceptions as `build_prediction_data` -- see its docstring.
 
     `image_shapes[i]` is unused by this function directly -- it exists so
     callers who already loop over `(cell_df, image_shape)` pairs for
@@ -555,13 +725,16 @@ def build_multi_image_prediction_data(
     df = pd.concat(cell_dfs, ignore_index=True)
     fit_slice = df if train_idx is None else df.iloc[train_idx]
     x_global, global_scaler = _scale_columns(
-        df, fit_slice, global_x_cols, scaling, arcsinh_cofactor, subtract_background, no_background_cols, no_transform_cols
+        df, fit_slice, global_x_cols, scaling, arcsinh_cofactor, subtract_background,
+        no_background_cols, no_transform_cols, no_scale_cols, custom_background,
     )
     x_neighbor, neighbor_scaler = _scale_columns(
-        df, fit_slice, neighbor_x_cols, scaling, arcsinh_cofactor, subtract_background, no_background_cols, no_transform_cols
+        df, fit_slice, neighbor_x_cols, scaling, arcsinh_cofactor, subtract_background,
+        no_background_cols, no_transform_cols, no_scale_cols, custom_background,
     )
     y, y_scaler = _scale_columns(
-        df, fit_slice, y_cols, scaling, arcsinh_cofactor, subtract_background, no_background_cols, no_transform_cols
+        df, fit_slice, y_cols, scaling, arcsinh_cofactor, subtract_background,
+        no_background_cols, no_transform_cols, no_scale_cols, custom_background,
     )
 
     return dict(
@@ -592,6 +765,7 @@ def train_neighbor_predictor(
     desc: str = "training",
     batch_size: Optional[int] = None,
     num_neighbors: Optional[Sequence[int]] = None,
+    use_amp: bool = False,
 ) -> dict[str, list[float]]:
     """
     Full-batch transductive training (mirrors `tools.morphology.train_gnn`): every
@@ -599,6 +773,17 @@ def train_neighbor_predictor(
     control which cells' own loss/gradients/early-stopping count. Works for both
     `NeighborIFPredictor` (this module) and `models.gat.NeighborIFPredictorGAT` --
     same `forward(x_neighbor, edge_index, edge_weight, x_global)` signature.
+
+    `use_amp=True` runs the forward pass (and loss) under `torch.autocast` in
+    fp16, with a `GradScaler` handling the backward/step -- roughly halves
+    activation/attention-tensor memory, at the cost of some numerical
+    precision (occasionally an unstable loss on aggressive learning rates;
+    the scaler mitigates but doesn't eliminate this). Only takes effect on
+    CUDA -- a no-op elsewhere, since fp16 autocast isn't well-supported on
+    CPU/MPS for this kind of model. Combines with `use_checkpoint` on the
+    model (`NeighborRadiusGNN`/`NeighborRadiusGAT`) for further savings; the
+    two are independent knobs affecting different things (numeric precision
+    vs. what's stored for backward).
 
     `batch_size` (default `None` -- the full-batch behavior above, unchanged): set
     it to switch to neighbor-sampled MINIBATCH training via `torch_geometric.loader.
@@ -625,6 +810,8 @@ def train_neighbor_predictor(
     approximated (randomly subsampled) neighborhood per step.
     """
     model = model.to(device)
+    amp_enabled = use_amp and str(device).startswith("cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     if batch_size is None:
         x_neighbor = data["x_neighbor"].to(device)
@@ -667,14 +854,16 @@ def train_neighbor_predictor(
         if batch_size is None:
             model.train()
             opt.zero_grad()
-            pred, _ = model(x_neighbor, edge_index, edge_weight, x_global)
-            train_loss = F.mse_loss(pred[train_mask], y[train_mask])
-            train_loss.backward()
-            opt.step()
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                pred, _ = model(x_neighbor, edge_index, edge_weight, x_global)
+                train_loss = F.mse_loss(pred[train_mask], y[train_mask])
+            scaler.scale(train_loss).backward()
+            scaler.step(opt)
+            scaler.update()
             train_loss = train_loss.item()
 
             model.eval()
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
                 pred, _ = model(x_neighbor, edge_index, edge_weight, x_global)
                 val_loss = F.mse_loss(pred[val_mask], y[val_mask]).item()
         else:
@@ -683,13 +872,15 @@ def train_neighbor_predictor(
             for batch in train_loader:
                 batch = batch.to(device)
                 opt.zero_grad()
-                pred, _ = model(batch.x, batch.edge_index, batch.edge_weight, batch.x_global)
-                # Only the first `batch.batch_size` nodes are TARGETS -- the rest are
-                # sampled neighbors pulled in purely to support message passing, the
-                # same role border-excluded/non-train cells play in the full-batch path.
-                loss = F.mse_loss(pred[: batch.batch_size], batch.y[: batch.batch_size])
-                loss.backward()
-                opt.step()
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                    pred, _ = model(batch.x, batch.edge_index, batch.edge_weight, batch.x_global)
+                    # Only the first `batch.batch_size` nodes are TARGETS -- the rest are
+                    # sampled neighbors pulled in purely to support message passing, the
+                    # same role border-excluded/non-train cells play in the full-batch path.
+                    loss = F.mse_loss(pred[: batch.batch_size], batch.y[: batch.batch_size])
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
                 total_loss += loss.item() * batch.batch_size
                 total_n += batch.batch_size
             train_loss = total_loss / total_n
@@ -699,8 +890,9 @@ def train_neighbor_predictor(
             with torch.no_grad():
                 for batch in val_loader:
                     batch = batch.to(device)
-                    pred, _ = model(batch.x, batch.edge_index, batch.edge_weight, batch.x_global)
-                    vloss = F.mse_loss(pred[: batch.batch_size], batch.y[: batch.batch_size])
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled):
+                        pred, _ = model(batch.x, batch.edge_index, batch.edge_weight, batch.x_global)
+                        vloss = F.mse_loss(pred[: batch.batch_size], batch.y[: batch.batch_size])
                     total_val_loss += vloss.item() * batch.batch_size
                     total_val_n += batch.batch_size
             val_loss = total_val_loss / total_val_n
@@ -736,12 +928,20 @@ def predict_df(
     `y_scaler=None` explicitly to see both in the model's raw SCALED output space
     instead (no inverse-transform) -- same convention as
     `models.cnn.predict_patch_df`.
+
+    Always runs on CPU, regardless of what device `model` was trained on:
+    `train_neighbor_predictor` moves `model` to its `device` arg, but never
+    moves `data` (its full-batch forward path only moves its OWN local copies;
+    its minibatch path moves each sampled batch, not the underlying `data`), so
+    `data` here is always CPU tensors -- moving `model` back to CPU is what
+    keeps this callable at all after GPU/MPS training, not just what avoids
+    reintroducing a full-graph GPU memory allocation for eval alone.
     """
     if y_scaler is _AUTO:
         y_scaler = data["y_scaler"]
+    model = model.to("cpu")
     model.eval()
-    with torch.no_grad():
-        pred, _ = model(data["x_neighbor"], data["edge_index"], data["edge_weight"], data["x_global"])
+    pred, _ = model(data["x_neighbor"], data["edge_index"], data["edge_weight"], data["x_global"])
     mask_np = mask.cpu().numpy()
     pred_scaled = pred[mask].cpu().numpy()
     true_scaled = data["y"][mask].cpu().numpy()
