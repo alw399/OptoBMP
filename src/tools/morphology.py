@@ -851,30 +851,65 @@ def plot_pred_vs_actual(
     return fig
 
 
-def plot_residuals(
-    y_true_df: pd.DataFrame, y_pred_df: pd.DataFrame, cols: Optional[Sequence[str]] = None, title: str = "", max_cols: int = 5
+def plot_pred_vs_actual_by_group(
+    y_true_df: pd.DataFrame, y_pred_df: pd.DataFrame, groups: pd.Series, col: Optional[str] = None, title: str = "", s=5,
 ) -> plt.Figure:
-    cols = list(cols) if cols is not None else list(y_true_df.columns)
-    n_features = len(cols)
-    n_cols = max(1, min(n_features, max_cols))
-    n_rows = max(1, (n_features + n_cols - 1) // n_cols)
+    """
+    Same pred-vs-actual scatter as `plot_pred_vs_actual`, but split into one panel
+    per distinct value of `groups` PLUS a leading "all" panel -- e.g. a `two_part`
+    model's `data['y_positive']` mask, to see whether error concentrates in the
+    classified-negative or classified-positive population rather than spreading
+    uniformly across both.
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows), squeeze=False)
-    axes_flat = axes.flatten()
+    `groups` is reindexed to `y_true_df`'s index internally, so it can be the
+    FULL-dataset mask straight from `build_prediction_data` even when
+    `y_true_df`/`y_pred_df` only cover a train/val/test subset -- no need to
+    pre-filter it (or align it) yourself before calling this.
 
-    for i, col in enumerate(cols):
-        ax = axes_flat[i]
-        yt = y_true_df[col].to_numpy()
-        resid = y_pred_df[col].to_numpy() - yt
-        ax.scatter(yt, resid, s=3, alpha=0.15, linewidths=0)
-        ax.axhline(0, color="r", linestyle="--", linewidth=1)
+    `col` selects which column of `y_true_df`/`y_pred_df` to plot; defaults to
+    the first (and, for a single-target `y_cols`, usually only) column -- unlike
+    `plot_pred_vs_actual`, this always plots ONE column, since the panels here
+    facet by `groups`, not by column.
+
+    A panel whose `yt` (actual) has ZERO variance -- e.g. the `y_positive=0`
+    group under a `two_part` hurdle target, where every cell floors to exactly
+    the same value -- falls back to a density histogram of `yp` (predicted)
+    instead of the usual scatter: $R^2$ is undefined when actual has no spread
+    (its denominator, `yt`'s variance, is 0), and a scatter against a constant
+    actual is just a vertical line of points, so neither actually shows
+    anything -- the informative question for that panel is "what does the model
+    predict for cells it's certain are at this constant value", which the
+    histogram answers directly.
+    """
+    col = col or y_true_df.columns[0]
+    groups = groups.reindex(y_true_df.index)
+    group_values = sorted(groups.dropna().unique())
+    panels = [("all", y_true_df.index)] + [(f"{col}={g:g}", groups.index[groups == g]) for g in group_values]
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 4), squeeze=False)
+    axes = axes[0]
+
+    for ax, (label, idx) in zip(axes, panels):
+        yt = y_true_df.loc[idx, col].to_numpy()
+        yp = y_pred_df.loc[idx, col].to_numpy()
+
+        if np.ptp(yt) == 0:
+            ax.hist(yp, bins=30, density=True, color="steelblue", alpha=0.8)
+            ax.axvline(yt[0], color="r", linestyle="--", linewidth=1, label=f"actual = {yt[0]:g}")
+            ax.set_xlabel(f"predicted {col}")
+            ax.set_ylabel("density")
+            ax.legend()
+            ax.set_title(f"{label} (n={len(idx)})\nmean={yp.mean():.3g}  std={yp.std():.3g}")
+            continue
+
+        ax.scatter(yt, yp, s=s, alpha=0.9, linewidths=0)
+        lo, hi = min(yt.min(), yp.min()), max(yt.max(), yp.max())
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1)
+        r2 = r2_score(yt, yp)
+        mae = mean_absolute_error(yt, yp)
         ax.set_xlabel(f"actual {col}")
-        ax.set_ylabel("residual (pred - actual)")
-        ax.set_title(col)
-
-    # Remove any unused axes from the grid
-    for j in range(n_features, len(axes_flat)):
-        fig.delaxes(axes_flat[j])
+        ax.set_ylabel(f"predicted {col}")
+        ax.set_title(f"{label} (n={len(idx)})\n$R^2$={r2:.3f}  MAE={mae:.3g}")
 
     fig.suptitle(title)
     fig.tight_layout()
@@ -1899,12 +1934,6 @@ def split_patches(patches: list[dict], val_frac: float = 0.15, test_frac: float 
 def crop_image(image: np.ndarray, patch: dict) -> np.ndarray:
     """image: (C, H, W) -> (C, patch_size, patch_size)."""
     return image[:, patch["y0"] : patch["y1"], patch["x0"] : patch["x1"]]
-
-
-def crop_mask(mask: np.ndarray, patch: dict) -> np.ndarray:
-    """mask: (H, W) -> (patch_size, patch_size). For a single-channel array (e.g. a
-    label mask or the boolean in-cell mask), unlike `crop_image` which expects (C, H, W)."""
-    return mask[patch["y0"] : patch["y1"], patch["x0"] : patch["x1"]]
 
 
 def cells_mask_from_labels(label_mask: np.ndarray, valid_cell_ids) -> np.ndarray:

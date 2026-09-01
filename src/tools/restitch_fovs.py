@@ -85,15 +85,6 @@ def robust_global(values, tol):
     return np.median(values[keep])
 
 
-def resolve_shifts(measurements, global_val, tol, axis_idx):
-    """Per-seam: keep local measurement if close to global, else fall back."""
-    resolved = {}
-    for (idx, dy, dx) in measurements:
-        val = dy if axis_idx == 0 else dx
-        resolved[idx] = val if abs(val - global_val) < tol else global_val
-    return resolved
-
-
 def feather_blend(canvas, weight, tile, y0, x0, blend_width):
     h, w = tile.shape
     ramp_y = np.ones(h, dtype=np.float32)

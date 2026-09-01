@@ -1,6 +1,6 @@
 """
 Synthetic Cellpose-like label masks + cell_df feature tables, for testing/
-benchmarking the neighbor-prediction pipeline (models.gnn/models.gat) against data
+benchmarking the neighbor-prediction pipeline (models.predictors/models.gat) against data
 with KNOWN, controllable spatial structure, instead of only real microscopy data.
 
 Real reference (this project's actual data, `20260717T120225_pA_Activin_D4_48hr_
@@ -216,20 +216,6 @@ def simulate_cells(
     return label_mask, cell_df
 
 
-def simulate_perfect_cells(
-    image_shape: tuple[int, int] = (1998, 1998),
-    radius: float = RADIUS_MEAN_DEFAULT,
-    spacing: Optional[float] = None,
-    margin: Optional[float] = None,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """`simulate_cells` with no size/position jitter at all -- every cell
-    identical and perfectly hex-gridded. Thin, explicitly-named wrapper since
-    this is a commonly-wanted baseline case (no randomness, so no `seed`)."""
-    return simulate_cells(
-        image_shape, radius_mean=radius, radius_std=0.0, spacing=spacing, position_jitter_std=0.0, margin=margin
-    )
-
-
 def jitter_real_cells(
     label_mask: np.ndarray,
     cell_df: pd.DataFrame,
@@ -301,24 +287,6 @@ def jitter_real_cells(
     return jittered_label_mask, jittered_cell_df
 
 
-def simulate_jittered_cells(
-    image_shape: tuple[int, int] = (1998, 1998),
-    radius_mean: float = RADIUS_MEAN_DEFAULT,
-    radius_std: float = 2.5,
-    position_jitter_std: float = 3.0,
-    spacing: Optional[float] = None,
-    margin: Optional[float] = None,
-    seed: Optional[int] = None,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """`simulate_cells` with size/position jitter -- defaults (`radius_std=2.5`,
-    `position_jitter_std=3.0`) are calibrated to roughly match this project's
-    real data's size/spacing variability (see module docstring)."""
-    return simulate_cells(
-        image_shape, radius_mean=radius_mean, radius_std=radius_std, spacing=spacing,
-        position_jitter_std=position_jitter_std, margin=margin, seed=seed,
-    )
-
-
 def build_scaled_feature_frame(
     label_mask: np.ndarray,
     cell_df: pd.DataFrame,
@@ -333,7 +301,7 @@ def build_scaled_feature_frame(
     seed: int,
 ) -> pd.DataFrame:
     """
-    Runs the same `models.gnn.build_prediction_data` pipeline `sender_predict.ipynb` uses
+    Runs the same `models.data.build_prediction_data` pipeline `sender_predict.ipynb` uses
     for actual training, but only to recover its SCALED feature columns (plus
     `centroid_y`/`centroid_x`) as a plain DataFrame -- for a "does this look different
     before vs. after jitter" spatial-scatter comparison, not for training a model.
@@ -343,11 +311,12 @@ def build_scaled_feature_frame(
     results share identical scaling/train-split logic and are directly comparable
     (e.g. with a shared `vmin`/`vmax` per column across both calls' outputs).
 
-    Imports `models.gnn`/torch lazily, so importing `tools.simulated` itself stays free
+    Imports the model modules/torch lazily, so importing `tools.simulated` itself stays free
     of a torch_geometric dependency for callers who only need `simulate_cells`/
     `jitter_real_cells`.
     """
-    from models.gnn import border_mask, build_prediction_data
+    from models.graph import border_mask
+    from models.data import build_prediction_data
     from tools.morphology import local_density, split_indices
 
     cell_df = cell_df.copy()
@@ -360,7 +329,7 @@ def build_scaled_feature_frame(
     train_idx = valid_target_idx[train_pos]
 
     pred_data = build_prediction_data(
-        cell_df, if_cols, radius=pred_radius,
+        cell_df, radius=pred_radius,
         global_x_cols=global_x_cols, neighbor_x_cols=neighbor_x_cols, y_cols=y_cols,
         train_idx=train_idx, scaling=scaling,
         no_background_cols=["local_density"], no_transform_cols=["local_density"],

@@ -1,15 +1,15 @@
 """
-GAT (learned-attention) counterpart to `models.gnn.NeighborIFPredictor`.
+GAT (learned-attention) counterpart to `models.predictors.IFPredictor`.
 
-Same radius graph, same `global_x_cols`/`neighbor_x_cols`/`y_cols` split, same
-`build_prediction_data`/`train_neighbor_predictor` -- the only thing that changes is
-the neighbor encoder: `gnn.NeighborRadiusGNN` aggregates neighbors with a FIXED,
-precomputed distance weight (no learning involved in how much a neighbor counts);
-`NeighborRadiusGAT` below instead learns the attention, but the same precomputed
-distance weight (`gnn.build_radius_graph`'s `edge_weight`) is still fed in as an edge
-feature (`edge_dim=1`) that `GATConv`'s attention linearly incorporates -- so
-distance still informs the (now-learned) adjacency, it's just no longer the ONLY
-thing that does.
+Same self-inclusive radius graph, same `x_cols`/`y_cols` split, same
+`build_prediction_data`/`train_predictor` -- the only thing that changes is the
+encoder: `predictors.RadiusGNN` aggregates with a FIXED, precomputed distance weight (no
+learning involved in how much a neighbor -- or self -- counts); `RadiusGAT` below
+instead learns the attention, but the same precomputed distance weight
+(`graph.build_radius_graph`'s `edge_weight`, including each node's self-loop weight)
+is still fed in as an edge feature (`edge_dim=1`) that `GATConv`'s attention
+linearly incorporates -- so distance (0 for the self-loop) still informs the
+(now-learned) adjacency, it's just no longer the ONLY thing that does.
 """
 
 from typing import Optional
@@ -24,18 +24,23 @@ from torch_geometric.nn import GATConv
 from tools.morphology import init_output_layer
 
 # re-exported so a notebook only needs `from models.gat import ...` for the GAT run
-from models.gnn import build_radius_graph, build_prediction_data, train_neighbor_predictor, predict_df  # noqa: F401
+from models.graph import build_radius_graph  # noqa: F401
+from models.data import build_prediction_data  # noqa: F401
+from models.train import train_predictor, train_calibrated, calibrated_predict, predict_df  # noqa: F401
+from models.predictors import TwoPartHead
 
 
 def _init_distance_attention(conv: GATConv) -> None:
     """
     Re-initializes one `GATConv` layer's attention so it starts out EXACTLY
     reproducing the row-normalized distance-decay weighting
-    `models.gnn.WeightedNeighborConv` uses -- i.e. `attention(i, j) == w_ij /
+    `models.graph.WeightedRadiusConv` uses -- i.e. `attention(i, j) == w_ij /
     sum_k(w_ik)`, where `w` is the same distance-decay edge weight
-    (`models.gnn.normalize_distance_weights`) this conv receives as
+    (`models.graph.normalize_distance_weights`) this conv receives as
     `log(edge_weight)` -- instead of `GATConv`'s usual Glorot-random, nothing-
-    to-do-with-distance starting point.
+    to-do-with-distance starting point. Applies equally to the self-loop edge
+    (distance 0, the largest raw weight): at init, GAT starts out attending to
+    self exactly as much as the fixed-weight GNN would.
 
     Zeros `att_src`/`att_dst` (the NODE-feature-driven attention terms) so at
     init the attention logit depends ONLY on the edge feature; sets
@@ -45,8 +50,8 @@ def _init_distance_attention(conv: GATConv) -> None:
     scaling in `LeakyReLU`'s negative branch exactly cancels the `1/
     negative_slope` we baked into `att_edge` -- which makes `softmax_j(log(
     w_ij)) == w_ij / sum_j(w_j)`, the standard softmax-of-log identity.
-    Requires `NeighborRadiusGAT.forward` to feed `log(edge_weight)`, not the
-    raw `edge_weight`, as `edge_attr` -- see `distance_init` below.
+    Requires `RadiusGAT.forward` to feed `log(edge_weight)`, not the raw
+    `edge_weight`, as `edge_attr` -- see `distance_init` below.
 
     A STARTING point only, not a constraint: `att_src`/`att_dst` still receive
     gradients from the node features' contribution to the attention logit
@@ -59,22 +64,27 @@ def _init_distance_attention(conv: GATConv) -> None:
     nn.init.constant_(conv.att_edge, 1.0 / (conv.negative_slope * conv.out_channels))
 
 
-class NeighborRadiusGAT(nn.Module):
-    """Neighbor-only (`add_self_loops=False`, so a node never attends to itself)
-    stack of `GATConv` layers -- same shape/role as `gnn.NeighborRadiusGNN`, but
-    with learned, distance-informed (`edge_dim=1`) attention instead of a fixed
+class RadiusGAT(nn.Module):
+    """Self-inclusive stack of `GATConv` layers -- same shape/role as `gnn.RadiusGNN`,
+    but with learned, distance-informed (`edge_dim=1`) attention instead of a fixed
     distance weight. Every non-final layer concatenates its `heads` outputs; the
     final layer averages them (`concat=False`) so the output is exactly
     `out_channels` wide regardless of `heads`.
 
+    `add_self_loops=False`: NOT an exclusion of self -- the graph handed in already
+    carries an explicit self-loop edge per node (`gnn.build_radius_graph`, weighted
+    the same distance-decay way as any other edge), so `GATConv`'s own automatic
+    self-loop insertion is disabled here purely to avoid adding a SECOND, differently-
+    weighted self-loop on top of the one already present.
+
     `distance_init=True` warm-starts EVERY layer's attention via
     `_init_distance_attention` -- see its docstring -- so GAT starts out
     computing the exact same row-normalized distance-decay weighting the fixed
-    GNN uses, rather than near-uniform random attention, while remaining free
-    to learn away from it during training. Off by default: it doesn't change
-    any parameter's SHAPE (old checkpoints still load either way), only its
-    INITIAL VALUE, so this is purely a training-dynamics choice, not a
-    backwards-compatibility one -- opt in explicitly to use it.
+    GNN uses (self-loop included), rather than near-uniform random attention,
+    while remaining free to learn away from it during training. Off by default:
+    it doesn't change any parameter's SHAPE (old checkpoints still load either
+    way), only its INITIAL VALUE, so this is purely a training-dynamics choice,
+    not a backwards-compatibility one -- opt in explicitly to use it.
 
     `use_checkpoint=True` wraps each layer's `GATConv` call in
     `torch.utils.checkpoint.checkpoint` -- trades extra compute (each layer's
@@ -151,7 +161,10 @@ class NeighborRadiusGAT(nn.Module):
         plot needs (only the FINAL layer is naturally `(E,)`, since `num_layers - 1`
         forces `heads=1` there). Head-averages every layer's attention down to `(E,)`
         so callers get one comparable tensor per layer regardless of layer position
-        -- a no-op for the final layer, which already has exactly 1 head.
+        -- a no-op for the final layer, which already has exactly 1 head. `E` here
+        includes each node's self-loop edge (see `graph.build_radius_graph`), so a
+        node's attention to ITSELF is directly readable off the same tensor as its
+        attention to any neighbor.
 
         Always runs in eval mode with dropout disabled (`training=False` explicitly,
         not just relying on the caller having called `.eval()`), so the SAME
@@ -179,19 +192,23 @@ class NeighborRadiusGAT(nn.Module):
             self.train(was_training)
 
 
-class NeighborIFPredictorGAT(nn.Module):
-    """`NeighborRadiusGAT` encoder + a linear head that also sees `x_global` (the
-    cell's OWN `global_x_cols`, concatenated in directly) -- predicts `y_cols`.
-    Same `forward` signature as `gnn.NeighborIFPredictor`, so
-    `gnn.train_neighbor_predictor`/`gnn.predict_df` work on this model unchanged.
+class IFPredictorGAT(nn.Module):
+    """`RadiusGAT` encoder + a head -- predicts `y_cols` from the graph embedding
+    alone. Same `forward(x, edge_index, edge_weight)` signature as `predictors.IFPredictor`,
+    so `train.train_predictor`/`train.predict_df` work on this model unchanged.
 
-    `distance_init`/`use_checkpoint` are passed straight through to
-    `NeighborRadiusGAT` -- see its docstring."""
+    `two_part=True` swaps the plain linear head for a `gnn.TwoPartHead` -- see its
+    docstring, and `data.build_prediction_data`'s `two_part` option, which scales
+    `y` the way `TwoPartHead` expects (`scalers.HurdleScaler`, not `gnn.ColumnScaler`).
+    `False` (default): a plain `nn.Linear` head, completely unaffected by any of
+    this -- old checkpoints load unchanged.
+
+    `distance_init`/`use_checkpoint` are passed straight through to `RadiusGAT` --
+    see its docstring."""
 
     def __init__(
         self,
-        neighbor_in_channels: int,
-        global_in_channels: int,
+        in_channels: int,
         num_outputs: int,
         hidden_channels: int = 64,
         embedding_dim: int = 32,
@@ -200,19 +217,37 @@ class NeighborIFPredictorGAT(nn.Module):
         dropout: float = 0.1,
         distance_init: bool = False,
         use_checkpoint: bool = False,
+        two_part: bool = False,
     ):
         super().__init__()
-        self.encoder = NeighborRadiusGAT(
-            neighbor_in_channels, embedding_dim, hidden_channels, num_layers, heads, dropout, distance_init,
+        self.encoder = RadiusGAT(
+            in_channels, embedding_dim, hidden_channels, num_layers, heads, dropout, distance_init,
             use_checkpoint=use_checkpoint,
         )
-        self.head = nn.Linear(embedding_dim + global_in_channels, num_outputs)
-        init_output_layer(self.head)  # no activation follows this layer
+        self.two_part = two_part
+        if two_part:
+            self.head = TwoPartHead(embedding_dim, num_outputs)
+        else:
+            self.head = nn.Linear(embedding_dim, num_outputs)
+            init_output_layer(self.head)  # no activation follows this layer
 
     def forward(
-        self, x_neighbor: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor, x_global: torch.Tensor
+        self, x: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         edge_attr = edge_weight.unsqueeze(-1)  # GATConv wants (E, edge_dim), edge_weight is (E,)
-        z = self.encoder(x_neighbor, edge_index, edge_attr)
-        z_full = torch.cat([z, x_global], dim=1)
-        return self.head(z_full), z
+        z = self.encoder(x, edge_index, edge_attr)
+        if self.two_part:
+            combined, _, _, _ = self.head(z)
+            return combined, z
+        return self.head(z), z
+
+    def forward_two_part(
+        self, x: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Only valid when `two_part=True` -- see `gnn.IFPredictor.forward_two_part`,
+        same role, same returned tuple."""
+        assert self.two_part, "forward_two_part requires two_part=True"
+        edge_attr = edge_weight.unsqueeze(-1)
+        z = self.encoder(x, edge_index, edge_attr)
+        combined, logit, magnitude, _ = self.head(z)
+        return combined, logit, magnitude, z
